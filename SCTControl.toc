@@ -1,0 +1,9 @@
+## Interface: 11507
+## Title: SCT Control
+## Notes: Control Blizzard's floating/scrolling combat text - what's shown, where, how fast, how big.
+## Author: Adam
+## Version: @project-version@
+## SavedVariables: SCTControlDB
+## OptionalDeps: Blizzard_CombatText
+
+SCTControl.lua

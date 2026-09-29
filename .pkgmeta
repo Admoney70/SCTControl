@@ -1,0 +1,4 @@
+package-as: SCTControl
+
+ignore:
+  - README.md
