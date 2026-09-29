@@ -3,6 +3,7 @@
 ## Notes: Control Blizzard's floating/scrolling combat text - what's shown, where, how fast, how big.
 ## Author: Adam
 ## Version: @project-version@
+## X-Curse-Project-ID: 1718597
 ## SavedVariables: SCTControlDB
 ## OptionalDeps: Blizzard_CombatText
 
