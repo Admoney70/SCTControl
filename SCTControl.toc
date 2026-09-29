@@ -1,4 +1,4 @@
-## Interface: 11507
+## Interface: 16001
 ## Title: SCT Control
 ## Notes: Control Blizzard's floating/scrolling combat text - what's shown, where, how fast, how big.
 ## Author: Adam
