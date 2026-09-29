@@ -20,6 +20,12 @@ jobs:
       CF_API_KEY: ${{ secrets.CF_API_KEY }}
       GITHUB_OAUTH: ${{ secrets.GITHUB_TOKEN }}
     steps:
+      - name: Check CurseForge key
+        run: |
+          if [ -z "$CF_API_KEY" ]; then
+            echo "::error::The CF_API_KEY secret is missing. Add it under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
