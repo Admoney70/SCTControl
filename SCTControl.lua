@@ -31,6 +31,7 @@ local DEFAULTS = {
     areaX = 0, areaY = 60,
     speed = 80, distance = 150, fadeTime = 0.8, fontSize = 0, critScale = 1.25,
     font = "", outline = "DEFAULT", damageFont = false,
+    auraColorOn = true, auraColor = { r = 0.85, g = 0.85, b = 0.85 },
     split = { heal = false, aura = false, resource = false, other = false },
     pos = {
         heal     = { x = 220,  y = 60 },
@@ -388,12 +389,19 @@ local pending = {}
 local flusher = CreateFrame("Frame")
 local recentTypes = {}
 
-local function Flush(cat)
+local AURA_GAIN_TYPES = { SPELL_AURA_START = true, SPELL_AURA_START_HARMFUL = true }
+
+local function Flush(cat, kind)
     flusher:SetScript("OnUpdate", nil)
+    local c = db.auraColorOn and not isSecret(kind) and AURA_GAIN_TYPES[kind] and db.auraColor
     for i = 1, #pending do
         local p = pending[i]
         pending[i] = nil
-        Spawn(cat, p.msg, p.r, p.g, p.b, p.displayType, p.isStaggered)
+        if c then
+            Spawn(cat, p.msg, c.r, c.g, c.b, p.displayType, p.isStaggered)
+        else
+            Spawn(cat, p.msg, p.r, p.g, p.b, p.displayType, p.isStaggered)
+        end
     end
 end
 
@@ -412,7 +420,7 @@ local function OnBlizzardEvent(_, event, kind)
     if #pending == 0 then return end
     local cat = Classify(event, kind)
     NoteType(event, kind, cat)
-    Flush(cat)
+    Flush(cat, event == "COMBAT_TEXT_UPDATE" and kind or nil)
 end
 
 local SAMPLES = {
@@ -428,7 +436,9 @@ local sampleIndex = 0
 local function SendSample()
     sampleIndex = sampleIndex % #SAMPLES + 1
     local m = SAMPLES[sampleIndex]
-    Spawn(m[5], m[1], m[2], m[3], m[4], sampleIndex == 1 and "crit" or nil)
+    local r, g, b = m[2], m[3], m[4]
+    if m[5] == "aura" and db.auraColorOn then r, g, b = db.auraColor.r, db.auraColor.g, db.auraColor.b end
+    Spawn(m[5], m[1], r, g, b, sampleIndex == 1 and "crit" or nil)
 end
 
 local function Test()
@@ -718,6 +728,64 @@ local function MakeCycle(parent, x, y, prefix, getList, getValue, setValue, tip)
     return b
 end
 
+local function OpenColorPicker(c, onChange)
+    local r0, g0, b0 = c.r, c.g, c.b
+    local function apply()
+        c.r, c.g, c.b = ColorPickerFrame:GetColorRGB()
+        onChange()
+    end
+    local function cancel()
+        c.r, c.g, c.b = r0, g0, b0
+        onChange()
+    end
+    if ColorPickerFrame.SetupColorPickerAndShow then
+        ColorPickerFrame:SetupColorPickerAndShow({
+            r = r0, g = g0, b = b0, hasOpacity = false,
+            swatchFunc = apply, cancelFunc = cancel,
+        })
+    else
+        ColorPickerFrame.hasOpacity = false
+        ColorPickerFrame.func, ColorPickerFrame.cancelFunc = apply, cancel
+        ColorPickerFrame:SetColorRGB(r0, g0, b0)
+        ColorPickerFrame:Hide()  -- re-show so it picks up the new callbacks
+        ColorPickerFrame:Show()
+    end
+end
+
+local function MakeSwatch(parent, x, y, getColor, default)
+    local b = CreateFrame("Button", nil, parent)
+    b:SetSize(20, 20)
+    b:SetPoint("TOPLEFT", x, y)
+    b:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+    local border = b:CreateTexture(nil, "BACKGROUND")
+    border:SetAllPoints()
+    border:SetColorTexture(0, 0, 0, 1)
+    local fill = b:CreateTexture(nil, "ARTWORK")
+    fill:SetPoint("TOPLEFT", 2, -2)
+    fill:SetPoint("BOTTOMRIGHT", -2, 2)
+    b.Refresh = function()
+        local c = getColor()
+        fill:SetColorTexture(c.r, c.g, c.b, 1)
+    end
+    b:SetScript("OnClick", function(_, btn)
+        local c = getColor()
+        if btn == "RightButton" then
+            c.r, c.g, c.b = default.r, default.g, default.b
+            b.Refresh()
+        else
+            OpenColorPicker(c, b.Refresh)
+        end
+    end)
+    b:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:SetText("Left-click: pick colour\nRight-click: reset to default", 1, 1, 1, 1, true)
+        GameTooltip:Show()
+    end)
+    b:SetScript("OnLeave", GameTooltip_Hide)
+    table.insert(widgets, b)
+    return b
+end
+
 RefreshUI = function()
     for _, w in ipairs(widgets) do w.Refresh() end
 end
@@ -767,6 +835,12 @@ local function BuildUI()
     y = y - 40
     Header(x1, y, "Incoming text display"); y = y - 36
     for _, o in ipairs(SELF_SLIDERS) do MakeSlider(f, x1 + 5, y, o); y = y - 42 end
+    y = y + 4
+    MakeCheck(f, x1, y, "Aura gain colour",
+        function() return db.auraColorOn end,
+        function(on) db.auraColorOn = on end,
+        "Colour for buff and debuff gains. Unchecked, Blizzard's colours are used.")
+    MakeSwatch(f, x1 + 150, y - 2, function() return db.auraColor end, DEFAULTS.auraColor)
 
     -- Right column
     local x2 = 310
