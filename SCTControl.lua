@@ -7,9 +7,15 @@
 -- itself, with Blizzard's own copy hidden via SetAlpha(0). Secret text
 -- is only passed to SetText, never compared or modified.
 --
+-- Each message is sorted into a category (damage, heals, auras, resources,
+-- other) from the event Blizzard was handling when it added the message,
+-- so categories can be drawn in separate, independently placed areas.
+-- Outgoing numbers over your target are drawn by the engine itself and
+-- never pass through Lua, so they can only be toggled and scaled.
+--
 -- /sctc                 open options
 -- /sctc test            show sample messages
--- /sctc move            unlock/lock the text area
+-- /sctc move            unlock/lock the text areas
 -- /sctc reset           restore defaults
 -- /sctc cvars [filter]  list matching CVars on this client
 -- /sctc debug           show hook state
@@ -25,11 +31,35 @@ local DEFAULTS = {
     areaX = 0, areaY = 60,
     speed = 80, distance = 150, fadeTime = 0.8, fontSize = 0, critScale = 1.25,
     font = "", outline = "DEFAULT", damageFont = false,
+    split = { heal = false, aura = false, resource = false, other = false },
+    pos = {
+        heal     = { x = 220,  y = 60 },
+        aura     = { x = 0,    y = 300 },
+        resource = { x = -220, y = 60 },
+        other    = { x = 0,    y = -120 },
+    },
 }
+
+local function DeepCopy(v)
+    if type(v) ~= "table" then return v end
+    local t = {}
+    for k, x in pairs(v) do t[k] = DeepCopy(x) end
+    return t
+end
+
+local function MergeDefaults(dst, src)
+    for k, v in pairs(src) do
+        if type(v) == "table" then
+            if type(dst[k]) ~= "table" then dst[k] = {} end
+            MergeDefaults(dst[k], v)
+        elseif dst[k] == nil then
+            dst[k] = v
+        end
+    end
+end
 
 local db
 local hooked = false
-local mover
 
 local function Print(msg) print("|cff33ff99SCT Control:|r " .. msg) end
 
@@ -109,8 +139,8 @@ local SELF_TOGGLES = {
 }
 
 local SELF_SLIDERS = {
-    { key = "areaX",    label = "Horizontal position",   min = -1500, max = 1500, step = 5,   fmt = "%d" },
-    { key = "areaY",    label = "Vertical position",     min = -1000, max = 1000, step = 5,   fmt = "%d" },
+    { key = "areaX",    label = "Main area X",           min = -1500, max = 1500, step = 5,   fmt = "%d" },
+    { key = "areaY",    label = "Main area Y",           min = -1000, max = 1000, step = 5,   fmt = "%d" },
     { key = "speed",    label = "Scroll speed (px/sec)", min = 10,    max = 400,  step = 5,   fmt = "%d" },
     { key = "distance", label = "Scroll distance (px)",  min = 30,    max = 800,  step = 10,  fmt = "%d" },
     { key = "fadeTime", label = "Fade time (sec)",       min = 0,     max = 3,    step = 0.1, fmt = "%.1f" },
@@ -156,15 +186,59 @@ end
 -- Renderer
 ---------------------------------------------------------------------------
 local isSecret = issecretvalue or function() return false end
-local area = CreateFrame("Frame", "SCTControlArea", UIParent)
-area:SetSize(1, 1)
-area:SetFrameStrata("MEDIUM")
 
-local pool, active = {}, {}
+-- "damage" is the main area; it also takes any category not split out.
+local CATEGORIES = {
+    { key = "damage",   label = "Main (damage taken, misses)" },
+    { key = "heal",     label = "Heals" },
+    { key = "aura",     label = "Aura gains / fades" },
+    { key = "resource", label = "Resource gains" },
+    { key = "other",    label = "Other (combat, reactives, honor, rep)" },
+}
+
+local areas = {}
+for _, c in ipairs(CATEGORIES) do
+    local f = CreateFrame("Frame", nil, UIParent)
+    f:SetSize(1, 1)
+    f:SetFrameStrata("MEDIUM")
+    areas[c.key] = { key = c.key, label = c.label, frame = f, active = {} }
+end
+
+local driver = CreateFrame("Frame")
+local pool = {}
 local renderFailed = false
 local baseFont
 local xDir = 1
 local MAX_MESSAGES = 30
+
+local function IsSplit(cat) return cat ~= "damage" and db.split[cat] and true or false end
+local function AreaFor(cat) return IsSplit(cat) and areas[cat] or areas.damage end
+
+local function GetPos(cat)
+    if cat == "damage" then return db.areaX, db.areaY end
+    return db.pos[cat].x, db.pos[cat].y
+end
+
+local function SetPos(cat, x, y)
+    if cat == "damage" then db.areaX, db.areaY = x, y
+    else db.pos[cat].x, db.pos[cat].y = x, y end
+end
+
+---------------------------------------------------------------------------
+-- Categorising: Blizzard's COMBAT_TEXT_UPDATE carries the message type
+-- ("DAMAGE", "HEAL", "SPELL_AURA_START", ...) as its first argument.
+---------------------------------------------------------------------------
+local OTHER_TYPES = { SPELL_ACTIVE = true, HONOR_GAINED = true, FACTION = true }
+
+local function Classify(event, kind)
+    if event ~= "COMBAT_TEXT_UPDATE" then return "other" end  -- combat state, low health, combo points
+    if isSecret(kind) or type(kind) ~= "string" then return "damage" end
+    if OTHER_TYPES[kind] then return "other" end
+    if kind:find("AURA", 1, true) then return "aura" end
+    if kind:find("ENERGIZE", 1, true) then return "resource" end
+    if kind:find("HEAL", 1, true) or kind == "ABSORB_ADDED" then return "heal" end
+    return "damage"
+end
 
 local function BaseFont()
     if not baseFont then
@@ -196,8 +270,10 @@ end
 local function FloatMode() return tonumber(GetCV("floatingCombatTextFloatMode")) or 1 end
 
 local function PositionArea()
-    area:ClearAllPoints()
-    area:SetPoint("CENTER", UIParent, "CENTER", db.areaX, db.areaY)
+    for cat, a in pairs(areas) do
+        a.frame:ClearAllPoints()
+        a.frame:SetPoint("CENTER", UIParent, "CENTER", GetPos(cat))
+    end
 end
 
 local function StyleMessage(m)
@@ -211,60 +287,75 @@ local function PlaceMessage(m)
     local y = m.pos * (mode == 2 and -1 or 1)
     local x = m.x
     if mode == 3 then x = x + m.xDir * m.pos * 0.5 end
+    local anchor = m.area.frame
     m.fs:ClearAllPoints()
     if PixelUtil and PixelUtil.SetPoint then
-        PixelUtil.SetPoint(m.fs, "CENTER", area, "CENTER", x, y)
+        PixelUtil.SetPoint(m.fs, "CENTER", anchor, "CENTER", x, y)
     else
         -- Manual snap to whole physical pixels
         local ph = GetPhysicalScreenSize and select(2, GetPhysicalScreenSize()) or 768
-        local px = area:GetEffectiveScale() * ph / 768  -- physical pixels per unit
-        m.fs:SetPoint("CENTER", area, "CENTER",
+        local px = anchor:GetEffectiveScale() * ph / 768  -- physical pixels per unit
+        m.fs:SetPoint("CENTER", anchor, "CENTER",
             math.floor(x * px + 0.5) / px, math.floor(y * px + 0.5) / px)
     end
 end
 
-local function Release(i)
-    local m = table.remove(active, i)
+local function Release(a, i)
+    local m = table.remove(a.active, i)
     m.fs:Hide()
     m.fs:SetText("")
     pool[#pool + 1] = m.fs
 end
 
+local function ActiveCount()
+    local n = 0
+    for _, a in pairs(areas) do n = n + #a.active end
+    return n
+end
+
 local function OnUpdate(_, elapsed)
     local speed, dist = db.speed, db.distance
     local fadeDist = speed * db.fadeTime
-    for i = #active, 1, -1 do
-        local m = active[i]
-        m.pos = m.pos + speed * elapsed
-        if m.pos >= dist then
-            Release(i)
-        else
-            local remain = dist - m.pos
-            m.fs:SetAlpha((fadeDist > 0 and remain < fadeDist) and (remain / fadeDist) or 1)
-            PlaceMessage(m)
+    local any = false
+    for _, a in pairs(areas) do
+        local list = a.active
+        for i = #list, 1, -1 do
+            local m = list[i]
+            m.pos = m.pos + speed * elapsed
+            if m.pos >= dist then
+                Release(a, i)
+            else
+                local remain = dist - m.pos
+                m.fs:SetAlpha((fadeDist > 0 and remain < fadeDist) and (remain / fadeDist) or 1)
+                PlaceMessage(m)
+            end
         end
+        if #list > 0 then any = true end
     end
-    if #active == 0 then area:SetScript("OnUpdate", nil) end
+    if not any then driver:SetScript("OnUpdate", nil) end
 end
 
 local function Fallback(err)
     renderFailed = true
-    for i = #active, 1, -1 do Release(i) end
+    for _, a in pairs(areas) do
+        for i = #a.active, 1, -1 do Release(a, i) end
+    end
     if CombatText then CombatText:SetAlpha(1) end
     Print("custom display failed, showing Blizzard's text instead: " .. tostring(err))
 end
 
-local function Spawn(msg, r, g, b, displayType, isStaggered)
+local function Spawn(cat, msg, r, g, b, displayType, isStaggered)
     if renderFailed or not db then return end
-    if #active >= MAX_MESSAGES then Release(1) end
+    local a = AreaFor(cat)
+    if #a.active >= MAX_MESSAGES then Release(a, 1) end
 
     local crit = false
     if not isSecret(displayType) then crit = (displayType == "crit" or displayType == "sticky") end
     local staggered = false
     if not isSecret(isStaggered) then staggered = isStaggered and true or false end
 
-    local fs = table.remove(pool) or area:CreateFontString(nil, "OVERLAY")
-    local m = { fs = fs, crit = crit, x = staggered and math.random(-30, 30) or 0 }
+    local fs = table.remove(pool) or areas.damage.frame:CreateFontString(nil, "OVERLAY")
+    local m = { fs = fs, area = a, crit = crit, x = staggered and math.random(-30, 30) or 0 }
     xDir = -xDir
     m.xDir = xDir
     StyleMessage(m)
@@ -277,32 +368,67 @@ local function Spawn(msg, r, g, b, displayType, isStaggered)
     end
     if not pcall(fs.SetTextColor, fs, r, g, b) then fs:SetTextColor(1, 1, 1) end
 
-    -- Start below (or above, when scrolling down) the newest message so they
-    -- never overlap; all messages move at the same speed so gaps persist.
+    -- Start below (or above, when scrolling down) the newest message in
+    -- this area so they never overlap; all messages move at the same speed
+    -- so gaps persist.
     local lh = LineHeight(crit)
-    local last = active[#active]
+    local last = a.active[#a.active]
     m.pos = last and math.min(0, last.pos - lh) or 0
 
     fs:SetAlpha(1)
     fs:Show()
-    active[#active + 1] = m
+    a.active[#a.active + 1] = m
     PlaceMessage(m)
-    area:SetScript("OnUpdate", OnUpdate)
+    driver:SetScript("OnUpdate", OnUpdate)
+end
+
+-- Messages wait here until the OnEvent post-hook says which event added
+-- them. Anything added outside an event handler is flushed next frame.
+local pending = {}
+local flusher = CreateFrame("Frame")
+local recentTypes = {}
+
+local function Flush(cat)
+    flusher:SetScript("OnUpdate", nil)
+    for i = 1, #pending do
+        local p = pending[i]
+        pending[i] = nil
+        Spawn(cat, p.msg, p.r, p.g, p.b, p.displayType, p.isStaggered)
+    end
+end
+
+local function NoteType(event, kind, cat)
+    local k = isSecret(kind) and "<secret>" or tostring(kind)
+    table.insert(recentTypes, 1, format("%s %s -> %s", tostring(event), k, cat))
+    recentTypes[6] = nil
+end
+
+local function Queue(msg, r, g, b, displayType, isStaggered)
+    pending[#pending + 1] = { msg = msg, r = r, g = g, b = b, displayType = displayType, isStaggered = isStaggered }
+    flusher:SetScript("OnUpdate", function() Flush("damage") end)
+end
+
+local function OnBlizzardEvent(_, event, kind)
+    if #pending == 0 then return end
+    local cat = Classify(event, kind)
+    NoteType(event, kind, cat)
+    Flush(cat)
 end
 
 local SAMPLES = {
-    { "-1234",              1,   0.1,  0.1  },
-    { "+856",               0.1, 1,    0.1  },
-    { "+Blessing of Kings", 1,   1,    0    },
-    { "Dodge",              1,   1,    1    },
-    { "+45 Mana",           0,   0.44, 0.87 },
+    { "-1234",              1,   0.1,  0.1,  "damage" },
+    { "+856",               0.1, 1,    0.1,  "heal" },
+    { "+Blessing of Kings", 1,   1,    0,    "aura" },
+    { "Dodge",              1,   1,    1,    "damage" },
+    { "+45 Mana",           0,   0.44, 0.87, "resource" },
+    { "+Combat",            1,   0.1,  0.1,  "other" },
 }
 local sampleIndex = 0
 
 local function SendSample()
     sampleIndex = sampleIndex % #SAMPLES + 1
     local m = SAMPLES[sampleIndex]
-    Spawn(m[1], m[2], m[3], m[4], sampleIndex == 1 and "crit" or nil)
+    Spawn(m[5], m[1], m[2], m[3], m[4], sampleIndex == 1 and "crit" or nil)
 end
 
 local function Test()
@@ -310,22 +436,29 @@ local function Test()
     for i = 1, #SAMPLES do C_Timer.After((i - 1) * 0.3, SendSample) end
 end
 
-local PlaceMover -- forward
+local UpdateMovers -- forward
 
 local function ApplyAll()
     if not db then return end
     PositionArea()
-    for _, m in ipairs(active) do StyleMessage(m) end
-    if mover and mover:IsShown() then PlaceMover() end
+    for _, a in pairs(areas) do
+        for _, m in ipairs(a.active) do StyleMessage(m) end
+    end
+    UpdateMovers()
 end
 
 local function TryHook()
     if hooked or not (CombatText and CombatText.AddMessage) then return end
-    -- Post-hook: runs after Blizzard's secure AddMessage returns, so nothing
-    -- here taints Blizzard's code. We only read the arguments.
+    -- Post-hooks: run after Blizzard's secure code returns, so nothing here
+    -- taints it. We only read the arguments. AddMessage runs inside
+    -- CombatText's OnEvent, so the OnEvent hook fires right after it with
+    -- the event that produced the message.
     hooksecurefunc(CombatText, "AddMessage", function(_, msg, _, r, g, b, displayType, isStaggered)
-        Spawn(msg, r, g, b, displayType, isStaggered)
+        Queue(msg, r, g, b, displayType, isStaggered)
     end)
+    if CombatText:GetScript("OnEvent") then
+        CombatText:HookScript("OnEvent", OnBlizzardEvent)
+    end
     CombatText:SetAlpha(0)
     hooked = true
 end
@@ -333,47 +466,69 @@ end
 local function Debug()
     local IsLoaded = (C_AddOns and C_AddOns.IsAddOnLoaded) or IsAddOnLoaded
     Print("--- debug ---")
-    Print("Blizzard_CombatText loaded: " .. tostring(IsLoaded("Blizzard_CombatText")) .. ", hooked: " .. tostring(hooked))
+    Print("Blizzard_CombatText loaded: " .. tostring(IsLoaded("Blizzard_CombatText")) .. ", hooked: " .. tostring(hooked)
+        .. ", event hook: " .. tostring(CombatText and CombatText:GetScript("OnEvent") ~= nil))
     Print("enable CVar: " .. tostring(Resolve("enableFloatingCombatText")) .. " = " .. tostring(GetCV("enableFloatingCombatText")))
     Print("Blizzard frame alpha: " .. tostring(CombatText and CombatText:GetAlpha()))
-    Print(format("custom display failed: %s, active: %d, pooled: %d", tostring(renderFailed), #active, #pool))
+    Print(format("custom display failed: %s, active: %d, pooled: %d", tostring(renderFailed), ActiveCount(), #pool))
     local face, size, flags = FontSpec()
-    Print(format("font %s %s '%s' | area %d,%d | speed %d, distance %d, fade %.1f, mode %d",
-        tostring(face), tostring(size), tostring(flags), db.areaX, db.areaY, db.speed, db.distance, db.fadeTime, FloatMode()))
+    Print(format("font %s %s '%s' | speed %d, distance %d, fade %.1f, mode %d",
+        tostring(face), tostring(size), tostring(flags), db.speed, db.distance, db.fadeTime, FloatMode()))
+    for _, c in ipairs(CATEGORIES) do
+        local x, y = GetPos(c.key)
+        Print(format("  %s: %s", c.key,
+            (c.key == "damage" or IsSplit(c.key)) and format("own area at %d,%d", x, y) or "-> main"))
+    end
+    if #recentTypes == 0 then
+        Print("no categorised messages yet")
+    else
+        Print("recent messages:")
+        for _, t in ipairs(recentTypes) do Print("  " .. t) end
+    end
 end
 
 ---------------------------------------------------------------------------
--- Mover: a box covering the text path; drag it to move the area
+-- Movers: a box covering each area's text path; drag to move that area
 ---------------------------------------------------------------------------
 local RefreshUI -- forward
+local movers = {}
 local moverTicker
+local moving = false
 
-PlaceMover = function()
-    if not mover then return end
+local function PlaceMover(m)
+    local cat = m.cat
     local lh = LineHeight()
     local mode = FloatMode()
-    mover:ClearAllPoints()
-    mover:SetSize(mode == 3 and (db.distance + 260) or 260, db.distance + lh)
+    m:ClearAllPoints()
+    m:SetSize(mode == 3 and (db.distance + 260) or 260, db.distance + lh)
     if mode == 2 then
-        mover:SetPoint("TOP", area, "CENTER", 0, lh / 2)
+        m:SetPoint("TOP", areas[cat].frame, "CENTER", 0, lh / 2)
     else
-        mover:SetPoint("BOTTOM", area, "CENTER", 0, -lh / 2)
+        m:SetPoint("BOTTOM", areas[cat].frame, "CENTER", 0, -lh / 2)
     end
-    mover.label:SetText(format("Incoming text\n%d, %d\n|cffaaaaaadrag to move - /sctc move to lock|r",
-        db.areaX, db.areaY))
+    local x, y = GetPos(cat)
+    m.label:SetText(format("%s\n%d, %d\n|cffaaaaaadrag to move - /sctc move to lock|r",
+        areas[cat].label, x, y))
 end
 
-local function BuildMover()
-    local m = CreateFrame("Frame", "SCTControlMover", UIParent)
+local MOVER_COLORS = {
+    damage = { 0.1, 0.8, 0.3 }, heal = { 0.2, 0.5, 1 }, aura = { 0.9, 0.8, 0.1 },
+    resource = { 0.6, 0.3, 0.9 }, other = { 0.9, 0.4, 0.1 },
+}
+
+local function BuildMover(cat)
+    local m = CreateFrame("Frame", nil, UIParent)
+    m.cat = cat
     m:SetFrameStrata("HIGH")
     m:SetMovable(true)
     m:EnableMouse(true)
     m:RegisterForDrag("LeftButton")
     m:Hide()
 
+    local c = MOVER_COLORS[cat]
     local bg = m:CreateTexture(nil, "BACKGROUND")
     bg:SetAllPoints()
-    bg:SetColorTexture(0.1, 0.8, 0.3, 0.25)
+    bg:SetColorTexture(c[1], c[2], c[3], 0.25)
     m.label = m:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
     m.label:SetPoint("CENTER")
 
@@ -385,30 +540,40 @@ local function BuildMover()
         self:StopMovingOrSizing()
         if not self.x0 then return end
         local x1, y1 = self:GetCenter()
-        db.areaX = math.floor(db.areaX + (x1 - self.x0) + 0.5)
-        db.areaY = math.floor(db.areaY + (y1 - self.y0) + 0.5)
+        local x, y = GetPos(cat)
+        SetPos(cat, math.floor(x + (x1 - self.x0) + 0.5), math.floor(y + (y1 - self.y0) + 0.5))
         self.x0 = nil
         ApplyAll()
         if RefreshUI and SCTControlFrame and SCTControlFrame:IsShown() then RefreshUI() end
     end)
-    m:SetScript("OnHide", function()
-        if moverTicker then moverTicker:Cancel(); moverTicker = nil end
-    end)
     return m
 end
 
+UpdateMovers = function()
+    for _, c in ipairs(CATEGORIES) do
+        local cat = c.key
+        local show = moving and (cat == "damage" or IsSplit(cat))
+        if show then
+            movers[cat] = movers[cat] or BuildMover(cat)
+            PlaceMover(movers[cat])
+            movers[cat]:Show()
+        elseif movers[cat] then
+            movers[cat]:Hide()
+        end
+    end
+end
+
 local function ToggleMover()
-    if mover and mover:IsShown() then
-        mover:Hide()
-        Print("text area locked.")
+    moving = not moving
+    UpdateMovers()
+    if moverTicker then moverTicker:Cancel(); moverTicker = nil end
+    if not moving then
+        Print("text areas locked.")
         return
     end
-    mover = mover or BuildMover()
-    PlaceMover()
-    mover:Show()
     SendSample()
     moverTicker = C_Timer.NewTicker(0.8, SendSample)
-    Print("drag the green box; sample text keeps firing until you lock it.")
+    Print("drag the coloured boxes; sample text keeps firing until you lock them.")
 end
 
 ---------------------------------------------------------------------------
@@ -561,7 +726,7 @@ local Reset -- forward
 
 local function BuildUI()
     local f = CreateFrame("Frame", "SCTControlFrame", UIParent, "BasicFrameTemplateWithInset")
-    f:SetSize(600, 690)
+    f:SetSize(600, 710)
     f:SetPoint("CENTER")
     f:SetFrameStrata("DIALOG")
     f:SetClampedToScreen(true)
@@ -640,6 +805,22 @@ local function BuildUI()
         function(on) db.enforce = on end,
         "Pushes the settings you changed here back to the game on every login, overriding the Blizzard options panel.")
 
+    y = y - 30
+    Header(x2, y, "Show in their own area"); y = y - 20
+    for _, c in ipairs(CATEGORIES) do
+        if c.key ~= "damage" then
+            MakeCheck(f, x2, y, c.label,
+                function() return db.split[c.key] end,
+                function(on)
+                    db.split[c.key] = on
+                    ApplyAll()
+                    if on then Print(c.label .. " now have their own area; use Move to place it.") end
+                end,
+                "Draw these in a separate area you can place with Move. Unchecked, they share the main area.")
+            y = y - 24
+        end
+    end
+
     local function Btn(text, xOff, fn)
         local b = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
         b:SetSize(110, 24)
@@ -666,7 +847,7 @@ Reset = function()
         if def then RawSetCV(n, def) end
     end
     wipe(db.cvars)
-    for k, v in pairs(DEFAULTS) do if k ~= "cvars" then db[k] = v end end
+    for k, v in pairs(DEFAULTS) do if k ~= "cvars" then db[k] = DeepCopy(v) end end
     ApplyAll()
     if UI and UI:IsShown() then RefreshUI() end
     Print("reset to defaults.")
@@ -680,9 +861,7 @@ ev:SetScript("OnEvent", function(_, event, name)
         if name == ADDON then
             SCTControlDB = SCTControlDB or {}
             db = SCTControlDB
-            for k, v in pairs(DEFAULTS) do
-                if db[k] == nil then db[k] = (type(v) == "table") and {} or v end
-            end
+            MergeDefaults(db, DEFAULTS)
             -- Settings from older versions
             db.offsetX, db.offsetY, db.scrollTime = nil, nil, nil
             if type(db.distance) ~= "number" or db.distance < 30 then db.distance = DEFAULTS.distance end
