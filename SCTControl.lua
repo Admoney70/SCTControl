@@ -32,6 +32,7 @@ local DEFAULTS = {
     speed = 80, distance = 150, fadeTime = 0.8, fontSize = 0, critScale = 1.25,
     font = "", outline = "DEFAULT", damageFont = false,
     auraColorOn = true, auraColor = { r = 0.85, g = 0.85, b = 0.85 },
+    fadeColorOn = true, fadeColor = { r = 0.6, g = 0.6, b = 0.6 },
     split = { heal = false, aura = false, resource = false, other = false },
     pos = {
         heal     = { x = 220,  y = 60 },
@@ -389,11 +390,21 @@ local pending = {}
 local flusher = CreateFrame("Frame")
 local recentTypes = {}
 
-local AURA_GAIN_TYPES = { SPELL_AURA_START = true, SPELL_AURA_START_HARMFUL = true }
+local AURA_COLORS = {
+    SPELL_AURA_START = "aura", SPELL_AURA_START_HARMFUL = "aura",
+    SPELL_AURA_END   = "fade", SPELL_AURA_END_HARMFUL   = "fade",
+}
+
+-- Our colour override for this message type, or nil to keep Blizzard's
+local function OverrideColor(kind)
+    if kind == nil or isSecret(kind) then return end
+    local which = AURA_COLORS[kind]
+    if which and db[which .. "ColorOn"] then return db[which .. "Color"] end
+end
 
 local function Flush(cat, kind)
     flusher:SetScript("OnUpdate", nil)
-    local c = db.auraColorOn and not isSecret(kind) and AURA_GAIN_TYPES[kind] and db.auraColor
+    local c = OverrideColor(kind)
     for i = 1, #pending do
         local p = pending[i]
         pending[i] = nil
@@ -426,7 +437,8 @@ end
 local SAMPLES = {
     { "-1234",              1,   0.1,  0.1,  "damage" },
     { "+856",               0.1, 1,    0.1,  "heal" },
-    { "+Blessing of Kings", 1,   1,    0,    "aura" },
+    { "+Blessing of Kings", 1,   1,    0,    "aura", "SPELL_AURA_START" },
+    { "-Blessing of Kings", 0.1, 1,    0.1,  "aura", "SPELL_AURA_END" },
     { "Dodge",              1,   1,    1,    "damage" },
     { "+45 Mana",           0,   0.44, 0.87, "resource" },
     { "+Combat",            1,   0.1,  0.1,  "other" },
@@ -437,7 +449,8 @@ local function SendSample()
     sampleIndex = sampleIndex % #SAMPLES + 1
     local m = SAMPLES[sampleIndex]
     local r, g, b = m[2], m[3], m[4]
-    if m[5] == "aura" and db.auraColorOn then r, g, b = db.auraColor.r, db.auraColor.g, db.auraColor.b end
+    local c = OverrideColor(m[6])
+    if c then r, g, b = c.r, c.g, c.b end
     Spawn(m[5], m[1], r, g, b, sampleIndex == 1 and "crit" or nil)
 end
 
@@ -841,6 +854,12 @@ local function BuildUI()
         function(on) db.auraColorOn = on end,
         "Colour for buff and debuff gains. Unchecked, Blizzard's colours are used.")
     MakeSwatch(f, x1 + 150, y - 2, function() return db.auraColor end, DEFAULTS.auraColor)
+    y = y - 24
+    MakeCheck(f, x1, y, "Aura fade colour",
+        function() return db.fadeColorOn end,
+        function(on) db.fadeColorOn = on end,
+        "Colour for buff and debuff fades. Unchecked, Blizzard's colours are used.")
+    MakeSwatch(f, x1 + 150, y - 2, function() return db.fadeColor end, DEFAULTS.fadeColor)
 
     -- Right column
     local x2 = 310
