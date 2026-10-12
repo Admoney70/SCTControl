@@ -32,7 +32,7 @@ local DEFAULTS = {
     speed = 80, distance = 150, fadeTime = 0.8, fontSize = 0, critScale = 1.25,
     font = "", outline = "DEFAULT", damageFont = false,
     auraColorOn = true, auraColor = { r = 0.85, g = 0.85, b = 0.85 },
-    fadeColorOn = true, fadeColor = { r = 0.6, g = 0.6, b = 0.6 },
+    fadeColorOn = true, fadeColor = { r = 0.85, g = 0.85, b = 0.85 },
     split = { heal = false, aura = false, resource = false, other = false },
     pos = {
         heal     = { x = 220,  y = 60 },
